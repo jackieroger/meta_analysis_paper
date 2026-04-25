@@ -1,0 +1,249 @@
+---
+title: "01_analyze_pain_scores.Rmd"
+output: html_document
+date: "2025-12-12"
+---
+
+```{r setup, include = FALSE}
+
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(scales)
+library(meta)
+
+```
+
+### Load data
+
+```{r}
+
+pain_scores <- read_excel("data/pain scores.xlsx", sheet = 1) %>%
+  # Rename iud insertion to iud placement
+  mutate(`Procedure step` = ifelse(`Procedure step` == "IUD insertion", "IUD placement", `Procedure step`)) %>%
+  # Rename afterwards to post-procedure
+  mutate(`Procedure step` = ifelse(`Procedure step` == "Afterwards", "Post-procedure", `Procedure step`))
+study_characteristics <- read_excel("data/study characteristics.xlsx", sheet = 1)
+
+```
+
+### Pre-process pain scores for plotting
+
+```{r}
+
+pain_scores_for_plotting <- pain_scores %>%
+  # Whether the average pain statistic is a mean or a median
+  mutate(which_pain_statistic = case_when(
+    Study %in% c("Mody 2012", "Karasu 2017", "Dogan 2017", "Berens 2017", "Khedr 2024") ~ "mean",
+    Study %in% c("Cirik 2013", "Akers 2017", "Mody 2018") ~ "median"
+  )) %>%
+  # Whether patients are nulliparous, parous, or any
+  left_join(select(study_characteristics, Study, Parity)) %>%
+  # For pain scores on a scale of 0-100, scale to 0-10
+  mutate(Mean = ifelse(`Pain scale` == "0-100", Mean / 10, Mean),
+         Median = ifelse(`Pain scale` == "0-100", Median / 10, Median)) %>%
+  # Collapse all control arms (no treatment, sham, placebo) into one control arm label
+  mutate(Arm = ifelse(Arm == "Paracervical block", "Paracervical block", "Control")) %>%
+  mutate(Arm = factor(Arm, levels = c("Paracervical block", "Control"))) %>%
+  # Drop overall pain scores (don't end up using it since only one study assessed that)
+  filter(`Procedure step` != "Overall") %>%
+  # Order procedure steps
+  mutate(`Procedure step` = factor(`Procedure step`, levels = c("Speculum insertion", "Paracervical block", "Tenaculum placement", "Uterine sounding", "IUD placement", "Post-procedure"))) %>%
+  # Remove pain scores for paracervical block step for control group
+  filter(!(`Procedure step` == "Paracervical block" & Arm == "Control"))
+
+```
+
+### Plot all pain scores
+
+```{r}
+
+ggplot() +
+  geom_point(data = filter(pain_scores_for_plotting, which_pain_statistic == "mean"),
+             aes(`Procedure step`, Mean, color = Arm, shape = "circle")) +
+  geom_point(data = filter(pain_scores_for_plotting, which_pain_statistic == "median"),
+             aes(`Procedure step`, Median, color = Arm, shape = "triangle")) +
+  scale_x_discrete(labels = label_wrap(10)) +
+  scale_y_continuous(limits = c(0,10), n.breaks = 10, minor_breaks = c(0,10)) +
+  labs(shape = "Type of average") +
+  scale_shape_manual(values = c("circle", "triangle"), labels = c("Mean", "Median")) +
+  ylab("Average pain score") +
+  ggtitle("Pain per procedure step") +
+  theme_minimal()
+
+```
+
+### Plot pain scores stratified by parity
+
+```{r}
+
+ggplot() +
+  geom_point(data = filter(pain_scores_for_plotting, which_pain_statistic == "mean" & Parity %in% c("Nulliparous", "Parous")),
+             aes(`Procedure step`, Mean, color = Arm, shape = "circle")) +
+  geom_point(data = filter(pain_scores_for_plotting, which_pain_statistic == "median" & Parity %in% c("Nulliparous", "Parous")),
+             aes(`Procedure step`, Median, color = Arm, shape = "triangle")) +
+  facet_wrap(~ Parity) +
+  scale_x_discrete(labels = label_wrap(10)) +
+  scale_y_continuous(limits = c(0,10), n.breaks = 10, minor_breaks = c(0,10)) +
+  labs(shape = "Type of average") +
+  scale_shape_manual(values = c("circle", "triangle"), labels = c("Mean", "Median")) +
+  ylab("Average pain score") +
+  ggtitle("Pain per procedure step") +
+  theme_minimal()  
+
+```
+
+### Pre-process pain scores for meta-analysis
+
+```{r}
+
+# Akers 2017 reported medians and confidence intervals
+# So for the meta-analysis, we don't have enough info to approximate means using the standard methods (ie using iqr and range)
+# Instead, we will substitute the medians for means and then estimate standard deviation using the confidence intervals
+# For akers 2017, estimate some of the standard deviations using the confidence intervals
+pain_scores_for_meta_analysis <- pain_scores %>%
+  left_join(select(study_characteristics, Study, `Participants in paracervical block group`, `Participants in control group`), by = c("Study" = "Study")) %>%
+  dplyr::rename(pb_n = `Participants in paracervical block group`,
+                c_n = `Participants in control group`) %>%
+  mutate(Mean = ifelse(Study == "Akers 2017", Median, Mean),
+         `SD of mean` = case_when(
+           Study == "Akers 2017" & Arm == "Paracervical block" ~ sqrt(pb_n) * (`Upper 95 CI of median` - `Lower 95 CI of median`) / (2 * 1.96),
+           Study == "Akers 2017" & Arm != "Paracervical block" ~ sqrt(c_n) * (`Upper 95 CI of median` - `Lower 95 CI of median`) / (2 * 1.96),
+           TRUE ~ `SD of mean`))
+
+# Make separate columns for paracervical block and control arms
+pb_pain_scores <- pain_scores_for_meta_analysis %>%
+  filter(Arm == "Paracervical block") %>%
+  mutate(pb_mean = Mean,
+         pb_mean_sd = `SD of mean`,
+         pb_median = Median,
+         pb_q1 = Q1,
+         pb_q3 = Q3,
+         pb_min = Min,
+         pb_max = Max) %>%
+  select(c(1:3), c(18:26))
+c_pain_scores <- pain_scores_for_meta_analysis %>%
+  filter(Arm != "Paracervical block") %>%
+  mutate(c_mean = Mean,
+         c_mean_sd = `SD of mean`,
+         c_median = Median,
+         c_q1 = Q1,
+         c_q3 = Q3,
+         c_min = Min,
+         c_max = Max) %>%
+  select(c(1,3), c(20:26))
+
+# Combine
+pain_scores_for_meta_analysis <- left_join(pb_pain_scores, c_pain_scores, by = c("Study" = "Study", "Procedure step" = "Procedure step")) %>%
+  # Filter for steps that we are performing meta-analysis on
+  filter(`Procedure step` %in% c("Tenaculum placement", "Uterine sounding", "IUD placement", "Post-procedure")) %>%
+  # Remove the tenaculum pain score for mody 2018 (since we only have it for the paracervical block group as the control group got a tenaculum site injection so not a useful comparison there)
+  filter(!(Study == "Mody 2018" & `Procedure step` == "Tenaculum placement"))
+
+```
+
+### Tenaculum placement meta-analysis
+
+```{r}
+
+tenaculum_meta_analysis_results <- metacont(
+  # Experimental group (paracervical block)
+  n.e = pb_n, mean.e = pb_mean, sd.e = pb_mean_sd, median.e = pb_median, q1.e = pb_q1, q3.e = pb_q3, min.e = pb_min, max.e = pb_max,
+  # Control group (no treatment, sham, or placebo)
+  n.c = c_n, mean.c = c_mean, sd.c = c_mean_sd, median.c = c_median, q1.c = c_q1, q3.c = c_q3, min.c = c_min, max.c = c_max,
+  # Labels and data
+  studlab = Study,
+  label.e = "Paracervical block", label.c = "Control",
+  label.left = "Reduces pain", label.right = "Increases pain",
+  data = filter(pain_scores_for_meta_analysis,
+                `Procedure step` == "Tenaculum placement"),
+  # Summary measure
+  sm = "SMD", method.smd = "Hedges",
+  # Random effects meta-analysis
+  random = TRUE)
+
+tenaculum_meta_analysis_results
+forest(tenaculum_meta_analysis_results)
+
+```
+
+### Uterine sounding meta-analysis
+
+```{r}
+
+sounding_meta_analysis_results <- metacont(
+  # Experimental group (paracervical block)
+  n.e = pb_n, mean.e = pb_mean, sd.e = pb_mean_sd, median.e = pb_median, q1.e = pb_q1, q3.e = pb_q3, min.e = pb_min, max.e = pb_max,
+  # Control group (no treatment, sham, or placebo)
+  n.c = c_n, mean.c = c_mean, sd.c = c_mean_sd, median.c = c_median, q1.c = c_q1, q3.c = c_q3, min.c = c_min, max.c = c_max,
+  # Labels and data
+  studlab = Study,
+  label.e = "Paracervical block", label.c = "Control",
+  label.left = "Reduces pain", label.right = "Increases pain",
+  data = filter(pain_scores_for_meta_analysis,
+                `Procedure step` == "Uterine sounding"),
+  # Summary measure
+  sm = "SMD", method.smd = "Hedges",
+  # Random effects meta-analysis
+  random = TRUE)
+
+sounding_meta_analysis_results
+forest(sounding_meta_analysis_results)
+
+```
+
+### IUD insertion meta-analysis
+
+```{r}
+
+iud_meta_analysis_results <- metacont(
+  # Experimental group (paracervical block)
+  n.e = pb_n, mean.e = pb_mean, sd.e = pb_mean_sd, median.e = pb_median, q1.e = pb_q1, q3.e = pb_q3, min.e = pb_min, max.e = pb_max,
+  # Control group (no treatment, sham, or placebo)
+  n.c = c_n, mean.c = c_mean, sd.c = c_mean_sd, median.c = c_median, q1.c = c_q1, q3.c = c_q3, min.c = c_min, max.c = c_max,
+  # Labels and data
+  studlab = Study,
+  label.e = "Paracervical block", label.c = "Control",
+  label.left = "Reduces pain", label.right = "Increases pain",
+  data = filter(pain_scores_for_meta_analysis,
+                `Procedure step` == "IUD placement"),
+  # Summary measure
+  sm = "SMD", method.smd = "Hedges",
+  # Random effects meta-analysis
+  random = TRUE)
+
+iud_meta_analysis_results
+forest(iud_meta_analysis_results)
+
+```
+
+### Afterwards meta-analysis
+
+```{r}
+
+afterwards_meta_analysis_results <- metacont(
+  # Experimental group (paracervical block)
+  n.e = pb_n, mean.e = pb_mean, sd.e = pb_mean_sd, median.e = pb_median, q1.e = pb_q1, q3.e = pb_q3, min.e = pb_min, max.e = pb_max,
+  # Control group (no treatment, sham, or placebo)
+  n.c = c_n, mean.c = c_mean, sd.c = c_mean_sd, median.c = c_median, q1.c = c_q1, q3.c = c_q3, min.c = c_min, max.c = c_max,
+  # Labels and data
+  studlab = Study,
+  label.e = "Paracervical block", label.c = "Control",
+  label.left = "Reduces pain", label.right = "Increases pain",
+  data = filter(pain_scores_for_meta_analysis,
+                `Procedure step` == "Post-procedure"),
+  # Summary measure
+  sm = "SMD", method.smd = "Hedges",
+  # Random effects meta-analysis
+  random = TRUE)
+
+afterwards_meta_analysis_results
+forest(afterwards_meta_analysis_results)
+
+```
+
+
+
+
+
+
